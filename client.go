@@ -1,8 +1,11 @@
 package avroipc
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"io"
 	"log"
 	"net"
 
@@ -93,6 +96,67 @@ func (client *Client) sendFrames(requests ...[]byte) [][]byte {
 	return response
 }
 
+func (client *Client) sendFrameBatch(header []byte, bodies [][]byte) [][]byte {
+	var (
+		buffer  bytes.Buffer
+		payload bytes.Buffer
+	)
+
+	for _, body := range bodies {
+		// reset payload
+		payload.Reset()
+		// incr serial
+		client.serial = client.serial + 1
+
+		// write header
+		binary.Write(&payload, binary.BigEndian, int32(client.serial))
+		binary.Write(&payload, binary.BigEndian, int32(2))
+
+		// write body header
+		binary.Write(&payload, binary.BigEndian, int32(len(header)))
+		payload.Write(header)
+		// write body
+		binary.Write(&payload, binary.BigEndian, int32(len(body)))
+		payload.Write(body)
+
+		buffer.Write(payload.Bytes())
+	}
+
+	// send request
+	client.connection.Write(buffer.Bytes())
+
+	// read response
+	scanner := bufio.NewScanner(client.connection)
+	scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		if atEOF {
+			if len(data) == 0 {
+				return 0, nil, nil
+			}
+			return len(data), data, nil
+		}
+
+		if len(data) >= 4 {
+			var dataLength uint64
+			binary.Read(bytes.NewReader(data[0:4]), binary.BigEndian, &dataLength)
+			if int(dataLength)+4 <= len(data) {
+				return int(dataLength) + 4, data[:int(dataLength)+4], nil
+			}
+		}
+
+		return 0, nil, io.EOF
+	})
+
+	// must scan, if not scan will lead to INTEREST_CHANGED status
+	for scanner.Scan() {
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Printf("Invalid input: %s\n", err)
+	}
+
+	return nil
+}
+
 func (client *Client) getHandshakeRequest() []byte {
 
 	handShakeMap := make(map[string]interface{})
@@ -165,6 +229,16 @@ func (client *Client) Append(event *Event) {
 	messageHeader := messageHeader()
 	payload := event.Bytes()
 	client.sendFrames(messageHeader, payload)
+}
+
+// AppendBatch sends batch event to flume
+func (client *Client) AppendBatch(event []*Event) {
+	messageHeader := messageHeader()
+	bodies := make([][]byte, len(event))
+	for i := 0; i < len(event); i++ {
+		bodies[i] = event[i].Bytes()
+	}
+	client.sendFrameBatch(messageHeader, bodies)
 }
 
 // Codec is stateless and is safe to use by multiple go routines.
